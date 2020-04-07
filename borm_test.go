@@ -23,8 +23,8 @@ var (
 
 func init() {
 	var err error
-	// db, err = sql.Open("mysql", "root:@tcp(localhost:3306)/borm_test?charset=utf8mb4")
-	db, err = sql.Open("mysql", "root:semaphoredb@tcp(localhost:3306)/borm_test?charset=utf8mb4")
+	db, err = sql.Open("mysql", "root:@tcp(localhost:3306)/borm_test?charset=utf8mb4")
+	// db, err = sql.Open("mysql", "root:semaphoredb@tcp(localhost:3306)/borm_test?charset=utf8mb4")
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -96,6 +96,30 @@ func TestForceIndex(t *testing.T) {
 	})
 }
 
+func TestTransactional(t *testing.T) {
+	Convey("transactional", t, func() {
+		tbl := Table(db, "test").Debug()
+		tx, err := tbl.DB.BeginTx(context.Background(), nil)
+		So(err, ShouldBeNil)
+
+		rawsql, args, err := tbl.BuildInsertSQL("insert into", &xx{X: "n1", Y: 18})
+		So(err, ShouldBeNil)
+		result, err := tx.Exec(rawsql, args...)
+		So(err, ShouldBeNil)
+		t.Log(result.LastInsertId())
+
+		rawsql2, args2, _ := tbl.BuildUpdateSQL(V{"age": 11}, Where(Eq("name", "n1")))
+		result2, _ := tx.Exec(rawsql2, args2...)
+		fmt.Printf("%s %+v", rawsql2, args2)
+		t.Log(result2.LastInsertId())
+
+		err = tx.Commit()
+		if err != nil {
+			tx.Rollback()
+			log.Fatal(err)
+		}
+	})
+}
 func TestSelect(t *testing.T) {
 
 	Convey("normal", t, func() {

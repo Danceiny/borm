@@ -442,6 +442,129 @@ func (t *BormTable) Insert(objs interface{}, args ...BormItem) (int, error) {
 
 	return t.insert("insert into ", objs, args)
 }
+func (t *BormTable) BuildInsertSQL(prefix string, objs interface{}, args ...BormItem) (sql string, stmtArgs []interface{}, err error) {
+	var (
+		rt         = reflect2.TypeOf(objs)
+		isArray    bool
+		isPtrArray bool
+		rtPtr      reflect2.Type
+		rtElem     = rt
+
+		sb   strings.Builder
+		cols []reflect2.StructField
+	)
+
+	sb.WriteString(prefix + " ")
+
+	fieldEscape(&sb, t.Name)
+
+	sb.WriteString(" (")
+
+	switch rt.Kind() {
+	case reflect.Ptr:
+		rt = rt.(reflect2.PtrType).Elem()
+		rtElem = rt
+		if rt.Kind() == reflect.Slice {
+			rtElem = rtElem.(reflect2.ListType).Elem()
+			isArray = true
+
+			if rtElem.Kind() == reflect.Ptr {
+				rtPtr = rtElem
+				rtElem = rtElem.(reflect2.PtrType).Elem()
+				isPtrArray = true
+			}
+		}
+	// case reflect.Map:
+	// TODO
+	default:
+		return "", nil, errors.New("argument 2 should be map or ptr")
+	}
+
+	// Fields or None
+	// struct类型
+	if rtElem.Kind() != reflect.Struct {
+		return "", nil, errors.New("non-structure type not supported yet")
+	}
+
+	s := rtElem.(reflect2.StructType)
+	if len(args) > 0 && args[0].Type() == _fields {
+		m := t.getStructFieldMap(s)
+
+		for _, field := range args[0].(*fieldsItem).Fields {
+			f := m[field]
+			if f != nil {
+				cols = append(cols, f)
+			}
+		}
+
+		(args[0]).BuildSQL(&sb)
+		args = args[1:]
+
+	} else {
+		for i := 0; i < s.NumField(); i++ {
+			f := s.Field(i)
+			ft := f.Tag().Get("borm")
+
+			if !t.Cfg.UseNameWhenTagEmpty && ft == "" {
+				continue
+			}
+
+			if len(cols) > 0 {
+				sb.WriteString(",")
+			}
+
+			if ft == "" {
+				fieldEscape(&sb, f.Name())
+			} else {
+				fieldEscape(&sb, ft)
+			}
+
+			cols = append(cols, f)
+		}
+	}
+
+	sb.WriteString(") values ")
+
+	sbTmp := &sb
+	if isArray {
+		sbTmp = &strings.Builder{}
+	}
+
+	sbTmp.WriteString("(")
+	for j := range cols {
+		if j > 0 {
+			sbTmp.WriteString(",")
+		}
+		sbTmp.WriteString("?")
+	}
+	sbTmp.WriteString(")")
+
+	// inputArgs objs
+	if isArray {
+		// 数组
+		for i := 0; i < rt.(reflect2.SliceType).UnsafeLengthOf(reflect2.PtrOf(objs)); i++ {
+			if i > 0 {
+				sb.WriteString(",")
+			}
+			sb.WriteString(sbTmp.String())
+			t.inputArgs(&stmtArgs, cols, rtPtr, s, isPtrArray, rt.(reflect2.ListType).UnsafeGetIndex(reflect2.PtrOf(objs), i))
+		}
+	} else {
+		// 普通元素
+		t.inputArgs(&stmtArgs, cols, rtPtr, s, false, reflect2.PtrOf(objs))
+	}
+
+	// on duplicate key update
+	for _, arg := range args {
+		arg.BuildSQL(&sb)
+		arg.BuildArgs(&stmtArgs)
+	}
+
+	if t.Cfg.Debug {
+		log.Println(sb.String(), stmtArgs)
+	}
+	return sb.String(), stmtArgs, nil
+}
 
 func (t *BormTable) insert(prefix string, objs interface{}, args []BormItem) (int, error) {
 	var (
@@ -582,24 +705,15 @@ func (t *BormTable) insert(prefix string, objs interface{}, args []BormItem) (in
 	return int(row), nil
 }
 
-func (t *BormTable) Update(obj interface{}, args ...BormItem) (int, error) {
-	if config.Mock {
-		pc, fileName, _, _ := runtime.Caller(1)
-		if ok, _, n, e := checkMock(t.Name, "Update", runtime.FuncForPC(pc).Name(), fileName, path.Dir(fileName)); ok {
-			return n, e
-		}
-	}
-
+func (t *BormTable) BuildUpdateSQL(obj interface{}, args ...BormItem) (sql string, stmtArgs []interface{}, err error) {
 	if len(args) <= 0 {
-		return 0, errors.New("argument 3 cannot be omitted")
+		return "", nil, errors.New("argument 3 cannot be omitted")
 	}
 
 	var sb strings.Builder
 	sb.WriteString("update ")
 	fieldEscape(&sb, t.Name)
 	sb.WriteString(" set ")
-
-	var stmtArgs []interface{}
 
 	if m, ok := obj.(V); ok {
 		if args[0].Type() == _fields {
@@ -646,7 +760,7 @@ func (t *BormTable) Update(obj interface{}, args ...BormItem) (int, error) {
 		// case reflect.Map:
 		// TODO
 		default:
-			return 0, errors.New("argument 2 should be map or ptr")
+			return "", nil, errors.New("argument 2 should be map or ptr")
 		}
 
 		var cols []reflect2.StructField
@@ -654,7 +768,7 @@ func (t *BormTable) Update(obj interface{}, args ...BormItem) (int, error) {
 		// Fields or None
 		// struct类型
 		if rt.Kind() != reflect.Struct {
-			return 0, errors.New("non-structure type not supported yet")
+			return "", nil, errors.New("non-structure type not supported yet")
 		}
 
 		// Fields or KeyVals or None
@@ -713,8 +827,23 @@ func (t *BormTable) Update(obj interface{}, args ...BormItem) (int, error) {
 	if t.Cfg.Debug {
 		log.Println(sb.String(), stmtArgs)
 	}
+	return sb.String(), stmtArgs, nil
+}
 
-	res, err := t.DB.ExecContext(t.ctx, sb.String(), stmtArgs...)
+func (t *BormTable) Update(obj interface{}, args ...BormItem) (int, error) {
+	if config.Mock {
+		pc, fileName, _, _ := runtime.Caller(1)
+		if ok, _, n, e := checkMock(t.Name, "Update", runtime.FuncForPC(pc).Name(), fileName, path.Dir(fileName)); ok {
+			return n, e
+		}
+	}
+
+	rawsql, stmtArgs, err := t.BuildUpdateSQL(obj, args...)
+	if err != nil {
+		return 0, err
+	}
+
+	res, err := t.DB.ExecContext(t.ctx, rawsql, stmtArgs...)
 	if err != nil {
 		return 0, err
 	}
@@ -785,6 +914,7 @@ type BormDBIFace interface {
 	QueryRowContext(ctx context.Context, query string, args ...interface{}) *sql.Row
 	QueryContext(ctx context.Context, query string, args ...interface{}) (*sql.Rows, error)
 	ExecContext(ctx context.Context, query string, args ...interface{}) (sql.Result, error)
+	BeginTx(ctx context.Context, opts *sql.TxOptions) (*sql.Tx, error)
 }
 
 type BormTable struct {
